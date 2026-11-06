@@ -8,3 +8,6 @@ __pycache__/
 creatives/
 runs/
 .claude/settings.local.json
+
+# 사이트 업로드용 설정 (토큰 입력 후 커밋 금지)
+site_patch/meta_capi_config.php
