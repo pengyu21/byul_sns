@@ -1,8 +1,10 @@
 {
   "mcpServers": {
     "meta-ads": {
-      "command": "C:\startcording\페이스북\.venv\Scripts\python.exe",
-      "args": ["C:\startcording\페이스북\meta_ads_mcp\server.py"]
+      "command": "C:/startcording/페이스북/.venv/Scripts/python.exe",
+      "args": [
+        "C:/startcording/페이스북/meta_ads_mcp/server.py"
+      ]
     }
   }
 }
