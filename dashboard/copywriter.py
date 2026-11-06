@@ -1,8 +1,15 @@
-"""Claude API 로 광고 카피 + 이미지 문구를 생성한다 (의료광고 규정 반영)."""
+"""광고 카피 + 이미지 문구 생성 (의료광고 규정 반영).
+
+기본: 구독 로그인된 Claude Code(claude -p) — API 비용 없음.
+COPY_BACKEND=api + ANTHROPIC_API_KEY 설정 시 Claude API 사용."""
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Literal
 
 import anthropic
@@ -50,19 +57,73 @@ class CopyPlan(BaseModel):
     compliance_check: list[str] = Field(description="규정 점검 결과와 심의 시 주의점")
 
 
+def _claude_cli() -> str | None:
+    """구독 로그인된 Claude Code 실행 파일. npm 의 claude.cmd 대신 실제 exe 를 직접 호출(cmd 따옴표 문제 회피)."""
+    if os.getenv("CLAUDE_CLI_PATH"):
+        return os.getenv("CLAUDE_CLI_PATH")
+    shim = shutil.which("claude")
+    if not shim:
+        return None
+    exe = Path(shim).parent / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+    return str(exe) if exe.exists() else shim
+
+
+def backend() -> str:
+    """COPY_BACKEND=api 이고 키가 있으면 API, 아니면 구독(Claude Code)."""
+    if os.getenv("COPY_BACKEND", "subscription") == "api" and os.getenv("ANTHROPIC_API_KEY"):
+        return "api"
+    return "subscription" if _claude_cli() else "none"
+
+
 def available() -> bool:
-    return bool(os.getenv("ANTHROPIC_API_KEY"))
+    return backend() != "none"
 
 
-def generate(brief: dict, winners: list[dict], losers: list[dict], n: int = 3) -> CopyPlan:
-    """brief: 시술, 목표, 타겟, 랜딩, 혜택, 톤 등. winners/losers: 기존 광고 {문구, 단가, CTR}."""
-    client = anthropic.Anthropic()
-    user = (
+def _user_prompt(brief: dict, winners: list[dict], losers: list[dict], n: int) -> str:
+    return (
         f"## 광고 브리프\n{json.dumps(brief, ensure_ascii=False, indent=2)}\n\n"
         f"## 성과 좋은 기존 소재 (단가 낮은 순)\n{json.dumps(winners, ensure_ascii=False, indent=2)}\n\n"
         f"## 성과 나쁜 기존 소재\n{json.dumps(losers, ensure_ascii=False, indent=2)}\n\n"
         f"위 데이터를 분석해 서로 다른 앵글의 신규 소재 {n}개를 만들어 주세요."
     )
+
+
+def _generate_subscription(user: str) -> CopyPlan:
+    """Claude Code 헤드리스 모드(claude -p) — 구독 사용량으로 처리, API 과금 없음."""
+    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    cmd = [
+        _claude_cli(), "-p",
+        "--output-format", "json",
+        "--json-schema", json.dumps(CopyPlan.model_json_schema(), ensure_ascii=False),
+        "--system-prompt", SYSTEM,
+        "--tools", "",                 # 도구 없이 글만 쓰게
+        "--strict-mcp-config",         # 프로젝트 MCP(광고 API) 로드 안 함
+        "--setting-sources", "user",
+        "--no-session-persistence",
+        "--model", os.getenv("COPY_MODEL", "opus"),
+    ]
+    proc = subprocess.run(cmd, input=user, capture_output=True, text=True, encoding="utf-8",
+                          env=env, cwd=tempfile.gettempdir(), timeout=600,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        out = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Claude Code 실행 실패: {(proc.stderr or proc.stdout)[:400]}")
+    if out.get("is_error"):
+        raise RuntimeError(f"Claude Code 오류: {out.get('result') or out.get('subtype')} "
+                           "(구독 한도 초과 시 잠시 후 다시 시도)")
+    data = out.get("structured_output")
+    if data is None:
+        raise RuntimeError("구조화된 결과가 비어 있습니다. 다시 시도하세요.")
+    return CopyPlan.model_validate(data)
+
+
+def generate(brief: dict, winners: list[dict], losers: list[dict], n: int = 3) -> CopyPlan:
+    """brief: 시술, 목표, 타겟, 랜딩, 혜택, 톤 등. winners/losers: 기존 광고 {문구, 단가, CTR}."""
+    user = _user_prompt(brief, winners, losers, n)
+    if backend() == "subscription":
+        return _generate_subscription(user)
+    client = anthropic.Anthropic()
     resp = client.beta.messages.parse(
         model=MODEL,
         max_tokens=16000,

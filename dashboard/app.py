@@ -288,15 +288,16 @@ def creative_editor(key: str, plan_variants: list[dict]) -> list[dict]:
 
 def ai_panel(key: str, brief: dict, ref_ids: list[str]):
     if not copywriter.available():
-        st.warning("`.env`에 `ANTHROPIC_API_KEY`가 없어서 AI 생성을 쓸 수 없어요. 아래에 직접 입력하세요.")
+        st.warning("Claude Code(구독)를 찾지 못해 AI 생성을 쓸 수 없어요. 아래에 직접 입력하세요.")
         if st.button("빈 소재 3개 만들기", key=f"{key}_blank"):
             st.session_state[f"{key}_plan"] = {"insights": [], "compliance_check": [], "variants": [
                 {"angle": f"앵글{i + 1}", "primary_text": "", "headline": "", "description": "",
                  "image_headline": "", "image_subtext": "", "badge": "", "cta": "SIGN_UP"} for i in range(3)]}
         return
     n = st.slider("만들 소재 수", 2, 5, 3, key=f"{key}_n")
+    st.caption("엔진: " + ("Claude 구독 (API 비용 없음)" if copywriter.backend() == "subscription" else "Claude API (사용량 과금)"))
     if st.button("🤖 AI로 소재 생성", type="primary", key=f"{key}_gen"):
-        with st.spinner("기존 성과를 분석하고 소재를 만드는 중… (30초~1분)"):
+        with st.spinner("기존 성과를 분석하고 소재를 만드는 중… (1~3분)"):
             winners, losers = reference_ads(ref_ids, preset)
             try:
                 plan = copywriter.generate(brief, winners, losers, n)
