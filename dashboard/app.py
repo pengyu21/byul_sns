@@ -967,6 +967,8 @@ with st.sidebar:
     st.markdown(f"**{OV['account']['name']}**  \n<span class='muted'>{OV['page'].get('name')} · "
                 f"{OV['account']['account_status_text']}</span>", unsafe_allow_html=True)
     st.button("🔄 최신 데이터로", on_click=refresh, width="stretch")
+    if st.button("📏 홈페이지 측정 설치 가이드", width="stretch"):
+        show_guide()
     st.caption(f"🛡️ 새 광고는 모두 일시중지로 생성 · 캠페인당 최대 {money(meta.MAX_DAILY_BUDGET / 100)}/일 · "
                f"전체 최대 {money(meta.MAX_TOTAL_DAILY_BUDGET / 100)}/일 · 집행은 심의번호 필수")
 st.navigation(list(PAGES.values()), position="top").run()
