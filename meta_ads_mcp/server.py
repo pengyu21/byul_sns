@@ -354,8 +354,8 @@ def _validate(plan: dict) -> tuple[list[str], list[str]]:
         errs.append("creatives 가 비어 있음")
     for i, c in enumerate(crs):
         tag = f"creatives[{i}]"
-        if not (c.get("image_path") or c.get("image_hash")):
-            errs.append(f"{tag}: image_path 또는 image_hash 필요")
+        if not (c.get("image_path") or c.get("image_hash") or c.get("video_id")):
+            errs.append(f"{tag}: image_path / image_hash / video_id 중 하나 필요")
         if c.get("image_path") and not Path(c["image_path"]).exists():
             errs.append(f"{tag}: 파일 없음 {c['image_path']}")
         if not c.get("primary_text"):
@@ -445,7 +445,7 @@ def launch_campaign(plan: dict, dry_run: bool = True) -> dict:
 
         creative_ids = []
         for c in plan["creatives"]:
-            h = c.get("image_hash") or upload_image(c["image_path"])["image_hash"]
+            h = c.get("image_hash") or ("" if c.get("video_id") else upload_image(c["image_path"])["image_hash"])
             cr = _api("POST", f"{ACCOUNT}/adcreatives", data=creative_payload(c, h))
             creative_ids.append((c.get("name", "creative"), cr["id"]))
             created["creatives"].append({"name": c.get("name"), "id": cr["id"], "image_hash": h})
@@ -481,6 +481,27 @@ def launch_campaign(plan: dict, dry_run: bool = True) -> dict:
 
 
 def _creative_payload(c: dict, image_hash: str, default_link: str, lead_form_id: str | None = None) -> dict:
+    link = c.get("link") or default_link or (f"https://www.facebook.com/{PAGE_ID}" if lead_form_id else "")
+    cta = c.get("cta", "LEARN_MORE")
+    if c.get("video_id"):  # 기존 영상 재사용 + 새 문구
+        vd = {"video_id": c["video_id"], "message": c["primary_text"]}
+        if c.get("headline"):
+            vd["title"] = c["headline"]
+        if c.get("description"):
+            vd["link_description"] = c["description"]
+        if image_hash:
+            vd["image_hash"] = image_hash
+        elif c.get("thumbnail_url"):
+            vd["image_url"] = c["thumbnail_url"]
+        if lead_form_id:
+            vd["call_to_action"] = {"type": cta if cta != "NO_BUTTON" else "SIGN_UP",
+                                    "value": {"lead_gen_form_id": lead_form_id, "link": link}}
+        elif cta != "NO_BUTTON":
+            vd["call_to_action"] = {"type": cta, "value": {"link": link}}
+        spec = {"page_id": PAGE_ID, "video_data": vd}
+        if IG_USER_ID:
+            spec["instagram_user_id"] = IG_USER_ID
+        return {"name": c.get("name", "creative"), "object_story_spec": spec}
     link_data = {
         "link": c.get("link") or default_link or (f"https://www.facebook.com/{PAGE_ID}" if lead_form_id else ""),
         "message": c["primary_text"],
@@ -554,8 +575,8 @@ def add_ads_to_adset(adset_id: str, creatives: list[dict], link: str = "", dry_r
     if not form_id and not str(link).startswith("https://"):
         errs.append("랜딩 URL 을 찾지 못했습니다. link 를 직접 지정하세요.")
     for i, c in enumerate(creatives):
-        if not (c.get("image_path") or c.get("image_hash")):
-            errs.append(f"creatives[{i}]: image_path 또는 image_hash 필요")
+        if not (c.get("image_path") or c.get("image_hash") or c.get("video_id")):
+            errs.append(f"creatives[{i}]: image_path / image_hash / video_id 중 하나 필요")
         if not c.get("primary_text"):
             errs.append(f"creatives[{i}]: primary_text 필요")
         if c.get("cta", "LEARN_MORE") not in CTAS:
@@ -571,7 +592,7 @@ def add_ads_to_adset(adset_id: str, creatives: list[dict], link: str = "", dry_r
     run = {"name": f"add_to_{adset_id}", "creatives": creatives}
     try:
         for c in creatives:
-            h = c.get("image_hash") or upload_image(c["image_path"])["image_hash"]
+            h = c.get("image_hash") or ("" if c.get("video_id") else upload_image(c["image_path"])["image_hash"])
             cr = _api("POST", f"{ACCOUNT}/adcreatives", data=_creative_payload(c, h, link, form_id or None))
             ad = _api("POST", f"{ACCOUNT}/ads", data={
                 "name": c.get("name", "new_creative"), "adset_id": adset_id,
@@ -590,7 +611,7 @@ def list_ads_with_creatives(campaign_id: str) -> list:
     """캠페인의 광고별 소재 정보(썸네일, 본문, 헤드라인, 상태)를 조회한다. 성과 좋은 카피를 참고할 때 사용."""
     rows = _get_all(f"{campaign_id}/ads", {
         "fields": "id,name,effective_status,adset_id,adset{name},"
-                  "creative{thumbnail_url,image_url,body,title,object_story_spec}",
+                  "creative{thumbnail_url,image_url,image_hash,video_id,body,title,object_story_spec,asset_feed_spec}",
         "thumbnail_width": 300, "thumbnail_height": 300, "limit": 100,
     }, 3)
     out = []
@@ -604,8 +625,23 @@ def list_ads_with_creatives(campaign_id: str) -> list:
             "thumbnail": cr.get("thumbnail_url") or cr.get("image_url"),
             "body": cr.get("body") or ld.get("message", ""),
             "title": cr.get("title") or ld.get("name") or ld.get("title", ""),
+            **_media_of(cr),
         })
     return out
+
+
+def _media_of(cr: dict) -> dict:
+    """소재에서 재사용 가능한 미디어: 영상이면 video_id(+썸네일), 이미지면 image_hash."""
+    spec = cr.get("object_story_spec") or {}
+    vd, ld = spec.get("video_data") or {}, spec.get("link_data") or {}
+    afs = cr.get("asset_feed_spec") or {}
+    video_id = cr.get("video_id") or vd.get("video_id") or ((afs.get("videos") or [{}])[0]).get("video_id")
+    if video_id:
+        thumb = vd.get("image_url") or ((afs.get("videos") or [{}])[0]).get("thumbnail_url") or cr.get("thumbnail_url")
+        return {"media": "video", "video_id": video_id, "thumbnail_url": thumb,
+                "image_hash": vd.get("image_hash") or ""}
+    h = cr.get("image_hash") or ld.get("image_hash") or ((afs.get("images") or [{}])[0]).get("hash")
+    return {"media": "image", "image_hash": h} if h else {"media": None}
 
 
 def _save_run(plan: dict, created: dict, error: str | None = None) -> str:
@@ -775,6 +811,19 @@ def update_daily_budget(object_id: str, daily_budget: int, confirm: bool = False
                 "error": "사용자 승인 후 confirm=True 로 다시 호출하세요."}
     _api("POST", object_id, data={"daily_budget": daily_budget})
     return {"ok": True, "name": cur.get("name"), "from": old, "to": daily_budget}
+
+
+def fetch_leads(since_unix: int = 0, form_ids: list[str] | None = None) -> list[dict]:
+    """인스턴트 양식 리드 원본. ⚠️ 개인정보 포함 — MCP 도구가 아님. 상담 대시보드 연동 전용."""
+    forms = form_ids or [f["id"] for f in list_lead_forms()]
+    out = []
+    for fid in forms:
+        params = {"fields": "id,created_time,ad_id,ad_name,adset_id,campaign_id,campaign_name,form_id,"
+                            "platform,field_data", "limit": 100}
+        if since_unix:
+            params["filtering"] = [{"field": "time_created", "operator": "GREATER_THAN", "value": since_unix}]
+        out += _get_all(f"{fid}/leads", params, max_pages=50)
+    return out
 
 
 def active_daily_budget_total() -> int:

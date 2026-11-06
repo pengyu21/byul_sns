@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -26,6 +28,10 @@ import logic  # noqa: E402
 import copywriter  # noqa: E402
 
 BLUE = "#2a78d6"
+MIN_RESULTS = int(os.getenv("MIN_RESULTS_FOR_JUDGEMENT", "20"))   # 이 건수 미만이면 판단 보류
+CONSULT_DB = os.getenv("CONSULT_DB", r"C:\startcording\consult_dashboard\data\consultations.db")
+PIXEL_GUIDE = ROOT / "PIXEL_SETUP.md"
+MEDIA_KEYS = ("thumbnail", "body", "adset_id", "status", "media", "video_id", "thumbnail_url", "image_hash")
 st.set_page_config(page_title="Meta 광고 운영", page_icon="📈", layout="wide")
 st.markdown("""<style>
 div[data-testid="stMetricValue"] {font-size: 1.9rem;}
@@ -96,8 +102,8 @@ def money(v: float, d: int = 0) -> str:
 
 # ═════════════════════════ 공통 상태 ═════════════════════════
 if "period" not in st.session_state:
-    st.session_state.period = "최근 7일"
-DAYS = PERIODS[st.session_state.period or "최근 7일"]
+    st.session_state.period = "최근 14일"
+DAYS = PERIODS[st.session_state.period or "최근 14일"]
 PRESET = {7: "last_7d", 14: "last_14d", 30: "last_30d"}[DAYS]
 since, until = period_range(DAYS)
 p_since, p_until = period_range(DAYS, back=1)
@@ -112,20 +118,56 @@ except Exception as e:  # noqa: BLE001
     st.error(f"Meta 연결 실패: {e}")
     st.stop()
 
-GS = logic.group_summary(DF) if not DF.empty else pd.DataFrame()
+GS = logic.group_summary(DF[DF["전환측정"]]) if not DF.empty else pd.DataFrame()
 GROUP_AVG = {g: GS.loc[g, "평균단가"] for g in GS.index if pd.notna(GS.loc[g, "평균단가"])}
 NAME = DF.set_index("id")["캠페인"].to_dict() if not DF.empty else {}
 
 
+def _ads_one(cid: str, preset: str) -> list[dict]:
+    crs = {c["ad_id"]: c for c in meta.list_ads_with_creatives(cid)}
+    return [{**a, **{k: crs.get(a["ad_id"], {}).get(k) for k in MEDIA_KEYS}}
+            for a in meta.analyze_performance(preset, cid).get("ads", [])]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_all_ads(cids: tuple, preset: str) -> dict:
+    """여러 캠페인의 광고 성과 + 소재를 동시에(병렬) 불러온다."""
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return dict(zip(cids, ex.map(lambda c: _ads_one(c, preset), cids)))
+
+
 def ad_rows(cid: str) -> list[dict]:
-    """광고 성과 + 소재(썸네일/문구/광고세트) 합치기."""
-    crs = {c["ad_id"]: c for c in load_ad_creatives(cid)}
-    rows = []
-    for a in load_ad_perf(cid, PRESET):
-        c = crs.get(a["ad_id"], {})
-        rows.append({**a, "thumbnail": c.get("thumbnail"), "body": c.get("body", ""),
-                     "adset_id": c.get("adset_id"), "status": c.get("status")})
-    return rows
+    """광고 성과 + 소재(썸네일/문구/미디어) 합치기."""
+    return load_all_ads((cid,), PRESET)[cid]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_segments(cids: tuple, breakdowns: str) -> list[dict]:
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        parts = ex.map(lambda c: meta.get_insights("campaign", "last_30d", c, breakdowns=breakdowns), cids)
+    return [r for part in parts for r in part]
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_outcomes(since_: str, until_: str) -> pd.DataFrame:
+    return logic.outcome_by_campaign(CONSULT_DB, since_, until_)
+
+
+LEAD_IDS = tuple(DF.loc[DF["그룹"] == "잠재고객", "id"]) if not DF.empty else ()
+
+
+def placement_frame() -> pd.DataFrame:
+    seg = logic.segment_frame(load_segments(LEAD_IDS, "publisher_platform,platform_position"),
+                              ("publisher_platform", "platform_position"))
+    seg["위치"] = [logic.PLACEMENT_KO.get((a, b), f"{a} {b}") for a, b in
+                  zip(seg["publisher_platform"], seg["platform_position"])]
+    return seg
+
+
+def age_frame() -> pd.DataFrame:
+    seg = logic.segment_frame(load_segments(LEAD_IDS, "age,gender"), ("age", "gender"))
+    seg["구간"] = seg["age"] + "세 " + seg["gender"].map({"female": "여성", "male": "남성"}).fillna("미상")
+    return seg[seg["gender"] != "unknown"]
 
 
 def reference_ads(cids: list[str]) -> tuple[list[dict], list[dict]]:
@@ -133,8 +175,14 @@ def reference_ads(cids: list[str]) -> tuple[list[dict], list[dict]]:
     for cid in cids:
         for a in ad_rows(cid):
             if a["body"] and a["spend"] >= meta.MIN_SPEND:
-                pool.append({"문구": a["body"][:150], "단가": a["cpa"], "클릭률": a["link_ctr"],
-                             "결과": a["results"], "지출": a["spend"]})
+                grp = DF.set_index("id")["그룹"].get(cid, "")
+                pool.append({"문구": a["body"][:150], "단가": a["cpa"],
+                             "단가 기준": logic.PLAIN.get(grp, ("", "결과 1건당 비용"))[1],
+                             "클릭률": a["link_ctr"], "결과": a["results"], "지출": a["spend"]})
+    # 단가 기준이 다른 소재끼리는 순위를 매기지 않음 → 가장 많은 기준 하나만 사용
+    if pool:
+        main = max({p["단가 기준"] for p in pool}, key=lambda k: sum(p["단가 기준"] == k for p in pool))
+        pool = [p for p in pool if p["단가 기준"] == main]
     ranked = sorted([p for p in pool if p["단가"]], key=lambda p: p["단가"])
     losers = (ranked[-3:][::-1] if len(ranked) > 5 else []) + [p for p in pool if not p["단가"]][:2]
     return ranked[:5], losers
@@ -178,6 +226,11 @@ def confirm_pause(ids: list[str], names: list[str], key: str, what: str):
         st.rerun()
 
 
+@st.dialog("홈페이지 상담 신청 측정 — 설치 가이드", width="large")
+def show_guide():
+    st.markdown(PIXEL_GUIDE.read_text(encoding="utf-8") if PIXEL_GUIDE.exists() else "가이드 파일이 없어요.")
+
+
 def flash():
     for m in st.session_state.pop("flash", []):
         st.toast(m)
@@ -208,21 +261,44 @@ def page_home():
     k = st.columns(5)
     sp, psp = tot(DF, "지출($)"), tot(PREV, "지출($)")
     k[0].metric("광고비", money(sp), f"{(sp - psp) / psp * 100:+.0f}%" if psp else None, delta_color="off")
-    for i, (grp, label) in enumerate([("잠재고객", "상담 신청"), ("트래픽", "홈페이지 방문")]):
-        n, pn = tot(DF, "결과", grp), tot(PREV, "결과", grp)
-        u, pu = unit(DF, grp), unit(PREV, grp)
-        k[1 + i * 2].metric(label, f"{int(n):,}건", f"{(n - pn) / pn * 100:+.0f}%" if pn else None)
-        k[2 + i * 2].metric(f"{label} 1{'건' if grp == '잠재고객' else '회'}당 비용", money(u, 2 if grp == "잠재고객" else 3) if u else "–",
-                            f"{(u - pu) / pu * 100:+.0f}%" if u and pu else None, delta_color="inverse",
-                            help="낮을수록 좋아요. 초록색 = 지난 기간보다 저렴해짐")
+    n, pn = tot(DF, "결과", "잠재고객"), tot(PREV, "결과", "잠재고객")
+    u, pu = unit(DF, "잠재고객"), unit(PREV, "잠재고객")
+    k[1].metric("상담 신청", f"{int(n):,}건", f"{(n - pn) / pn * 100:+.0f}%" if pn else None)
+    k[2].metric("상담 1건당 비용", money(u, 2) if u else "–", f"{(u - pu) / pu * 100:+.0f}%" if u and pu else None,
+                delta_color="inverse", help="낮을수록 좋아요. 초록색 = 지난 기간보다 저렴해짐")
+    oc = load_outcomes(since, until)
+    rec_rate = oc["기록됨"].sum() / oc["리드DB"].sum() if not oc.empty and oc["리드DB"].sum() else 0
+    visits = int(oc["내원"].sum()) if not oc.empty else 0
+    k[3].metric("내원", f"{visits}건" if rec_rate else "기록 없음",
+                help="상담 통합 대시보드에서 메타광고 리드의 상태를 '내원/수술확정'으로 바꾸면 집계돼요")
+    lead_spend = tot(DF, "지출($)", "잠재고객")
+    k[4].metric("내원 1건당 광고비", money(lead_spend / visits) if visits else "–",
+                f"결과 기록률 {rec_rate:.0%}", delta_color="off",
+                help="진짜 효율 지표예요. 기록률이 높을수록 정확해져요")
 
     st.divider()
     recs, _ = logic.optimize_budgets(DF, int(round(DF.loc[DF["상태"] == "ACTIVE", "일예산($)"].sum() * 100)),
-                                     cap_cents=meta.MAX_DAILY_BUDGET, min_spend=meta.MIN_SPEND, learning_days=5)
+                                     cap_cents=meta.MAX_DAILY_BUDGET, min_spend=meta.MIN_SPEND, learning_days=5,
+                                     min_results=MIN_RESULTS)
     with st.spinner("소재 진단 중…"):
-        flags = {cid: ad_rows(cid) for cid in DF.loc[DF["운영일수"] >= 5, "id"]}
+        flags = load_all_ads(tuple(DF.loc[DF["운영일수"] >= 5, "id"]), PRESET)
+        seg_flags = logic.segment_flags(placement_frame(), "위치", min_spend=50, min_results=5) + \
+            logic.segment_flags(age_frame(), "구간", min_spend=80, min_results=10)
     todos = [t for t in logic.build_todos(DF, recs, flags, GROUP_AVG)
              if t.key not in st.session_state.get("done", set())]
+    bad_segs = [f for f in seg_flags if f["판정"] == "🔴"]
+    if bad_segs:
+        todos.append(logic.Todo("segments", 3, "insight", "🔍",
+                                f"비싼 노출 구간 {len(bad_segs)}개를 찾았어요 (최근 30일)",
+                                " · ".join(f"{f['구간']} {f['설명']}" for f in bad_segs[:3]),
+                                "자세히 보기", {}))
+    if rec_rate < 0.3 and not oc.empty:
+        todos.append(logic.Todo("record", 1, "record", "📝",
+                                f"상담 결과 기록률 {rec_rate:.0%} — 내원 여부를 기록해 주세요",
+                                "상담 통합 대시보드에서 메타광고 리드의 상태(예약·내원·수술확정·무효)를 바꿔 주시면, "
+                                "'싼 리드'가 아니라 '실제 내원으로 이어지는 캠페인'에 예산을 줄 수 있어요.",
+                                "", {}))
+    todos.sort(key=lambda t: t.priority)
     actions = [t for t in todos if t.kind != "wait"]
     waits = [t for t in todos if t.kind == "wait"]
 
@@ -244,6 +320,12 @@ def page_home():
             elif t.kind == "pause_campaign":
                 if c2.button(t.button, key=t.key, width="stretch"):
                     confirm_pause([t.payload["id"]], [t.payload["name"]], t.key, "캠페인")
+            elif t.kind == "measure":
+                if c2.button(t.button, key=t.key, width="stretch", type="primary"):
+                    show_guide()
+            elif t.kind == "insight":
+                if c2.button(t.button, key=t.key, width="stretch"):
+                    st.switch_page(PAGES["analysis"])
             elif t.kind == "creative":
                 with c2:
                     if st.button(t.button, key=t.key, width="stretch", type="primary"):
@@ -287,17 +369,25 @@ def page_campaigns():
         res_name, cost_name = logic.PLAIN[grp]
         sub = DF[DF["그룹"] == grp].copy()
         avg = GROUP_AVG.get(grp)
-        v = sub.apply(lambda r: logic.verdict(r, avg, 5, meta.MIN_SPEND), axis=1)
+        v = sub.apply(lambda r: logic.verdict(r, avg, 5, meta.MIN_SPEND, MIN_RESULTS), axis=1)
         sub["판정"], sub["한줄 설명"] = [x[0] for x in v], [x[1] for x in v]
         order = {"🔴": 0, "🟡": 1, "🟢": 2, "⏳": 3, "⚪": 4}
         sub = sub.sort_values(by="판정", key=lambda s: s.str[0].map(order))
         st.markdown(f"#### {logic.GROUP_NAME.get(grp, grp)}  "
                     f"<span class='muted'>평균 {cost_name} "
                     f"{money(avg, 2 if grp == '잠재고객' else 3) if avg else '–'}</span>", unsafe_allow_html=True)
+        cols_extra = []
+        if grp == "잠재고객":
+            oc = load_outcomes(since, until)
+            if not oc.empty and oc["기록됨"].sum():
+                sub = sub.join(oc[["기록됨", "내원"]], on="id")
+                sub["기록률"] = sub["기록됨"] / sub["결과"].where(sub["결과"] > 0)
+                sub["내원 1건당"] = sub["지출($)"] / sub["내원"].where(sub["내원"] > 0)
+                cols_extra = ["기록률", "내원", "내원 1건당"]
         view = sub.rename(columns={"결과": res_name, "단가($)": cost_name, "지출($)": "광고비",
                                    "일예산($)": "일예산", "링크CTR(%)": "클릭률"})
         ev = st.dataframe(
-            view[["판정", "캠페인", "한줄 설명", "일예산", "광고비", res_name, cost_name, "클릭률"]],
+            view[["판정", "캠페인", "한줄 설명", "일예산", "광고비", res_name, cost_name, "클릭률"] + cols_extra],
             hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key=f"tbl_{grp}",
             column_config={
                 "일예산": st.column_config.NumberColumn(format="$%.0f"),
@@ -305,6 +395,9 @@ def page_campaigns():
                 cost_name: st.column_config.NumberColumn(format="$%.2f" if grp == "잠재고객" else "$%.3f"),
                 "클릭률": st.column_config.NumberColumn(format="%.1f%%"),
                 res_name: st.column_config.NumberColumn(format="%d"),
+                "기록률": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1),
+                "내원": st.column_config.NumberColumn(format="%d"),
+                "내원 1건당": st.column_config.NumberColumn(format="$%.0f"),
             })
         if ev.selection.rows:
             st.session_state.open_cid = view.iloc[ev.selection.rows[0]]["id"]
@@ -319,7 +412,7 @@ def campaign_detail(cid: str):
         st.rerun()
     res_name, cost_name = logic.PLAIN.get(row["그룹"], ("결과", "단가"))
     st.markdown(f"## {row['캠페인']}")
-    v = logic.verdict(row, GROUP_AVG.get(row["그룹"]), 5, meta.MIN_SPEND)
+    v = logic.verdict(row, GROUP_AVG.get(row["그룹"]), 5, meta.MIN_SPEND, MIN_RESULTS)
     m = st.columns(5)
     m[0].metric("판정", v[0], help=v[1])
     m[1].metric("일예산", money(row["일예산($)"]))
@@ -422,11 +515,11 @@ def best_form(forms: list[dict], proc: str) -> str:
 def related_campaigns(proc: str, goal: str | None) -> list[str]:
     """시술명 앞글자(코/눈…)가 들어간 캠페인 + 부족하면 같은 목표 캠페인으로 채워 최소 3개."""
     kw = proc.strip()[:1]
-    refs = [i for i, n in NAME.items() if kw and kw in n]
     grp = {"lead": "잠재고객", "traffic": "트래픽"}.get(goal or "")
-    if len(refs) < 3 and grp:
-        refs += [i for i in DF.loc[DF["그룹"] == grp, "id"] if i not in refs]
-    return refs or list(NAME)
+    pool = list(DF.loc[DF["그룹"] == grp, "id"]) if grp else list(NAME)
+    refs = [i for i in pool if kw and kw in NAME[i]]
+    refs += [i for i in pool if i not in refs][:max(0, 3 - len(refs))]
+    return refs or pool
 
 
 def step_what(w):
@@ -556,7 +649,7 @@ def step_creative(w):
             with st.expander("📈 AI가 기존 성과에서 찾은 패턴", expanded=True):
                 for x in plan["insights"]:
                     st.markdown(f"- {x}")
-        w["creatives"] = creative_cards(plan["variants"])
+        w["creatives"] = creative_cards(plan["variants"], winner_media(refs))
         if plan.get("compliance_check"):
             with st.expander("⚖️ 의료광고 규정 점검"):
                 for x in plan["compliance_check"]:
@@ -573,12 +666,57 @@ CTA_KO = {"SIGN_UP": "가입하기", "LEARN_MORE": "더 알아보기", "APPLY_NO
           "GET_QUOTE": "견적 받기", "CONTACT_US": "문의하기", "BOOK_TRAVEL": "예약하기"}
 
 
-def creative_cards(variants: list[dict]) -> list[dict]:
+def winner_media(cids: list[str]) -> list[dict]:
+    """참고 캠페인에서 성과 좋은 순으로 재사용 가능한 사진/영상."""
+    pool = [a for cid in cids for a in ad_rows(cid) if a.get("media") and a["spend"] >= meta.MIN_SPEND]
+    pool.sort(key=lambda a: (a["cpa"] is None, a["cpa"] or 0))
+    seen, out = set(), []
+    for a in pool:
+        key = a.get("video_id") or a.get("image_hash")
+        if key and key not in seen:
+            seen.add(key)
+            out.append(a)
+    return out[:8]
+
+
+def creative_cards(variants: list[dict], media: list[dict]) -> list[dict]:
     out = []
     cols = st.columns(len(variants))
+    labels = ["🆕 글자 이미지 새로 만들기"] + [
+        f"{'🎬' if m['media'] == 'video' else '🖼️'} {m['ad'][:14]} (1건 {money(m['cpa'], 2) if m['cpa'] else '–'})"
+        for m in media]
     for i, (col, v) in enumerate(zip(cols, variants)):
         with col, st.container(border=True):
             st.markdown(f"**소재 {i + 1}** · {v.get('angle', '')}")
+            pick = st.selectbox("사진·영상", range(len(labels)), format_func=lambda j: labels[j],
+                                index=(i % len(media)) + 1 if media else 0, key=f"md{i}",
+                                help="성과 좋은 기존 사진·영상에 새 문구를 붙이는 게 보통 더 효율적이에요")
+            if pick:
+                m = media[pick - 1]
+                st.image(m.get("thumbnail_url") or m.get("thumbnail"), width="stretch")
+                st.caption(f"{'영상' if m['media'] == 'video' else '사진'} 재사용 · 원본: {m['ad']}")
+                st.warning("⚖️ 원본에 **전후 비교(Before/After)·후기·'○번 만에 성공'** 같은 표현이 있으면 "
+                           "의료법 제56조 위반 소지가 있어요. **심의를 통과한 원본만** 재사용하세요.", icon="⚠️")
+                v["primary_text"] = st.text_area("본문", v["primary_text"], key=f"pt{i}", height=170)
+                v["headline"] = st.text_input("제목", v["headline"], key=f"hl{i}")
+                with st.expander("✏️ 설명·버튼"):
+                    v["description"] = st.text_input("설명", v["description"], key=f"ds{i}")
+                    v["cta"] = st.selectbox("버튼", list(CTA_KO),
+                                            index=list(CTA_KO).index(v["cta"]) if v["cta"] in CTA_KO else 0,
+                                            format_func=CTA_KO.get, key=f"cta{i}")
+                if v.get("rationale"):
+                    st.caption(f"💡 {v['rationale']}")
+                c = {"name": f"{datetime.now():%y%m%d}_{v.get('angle', '')[:12]}_{i + 1}",
+                     "primary_text": v["primary_text"], "headline": v["headline"],
+                     "description": v["description"], "cta": v["cta"],
+                     "preview": m.get("thumbnail_url") or m.get("thumbnail")}
+                if m["media"] == "video":
+                    c.update(video_id=m["video_id"], thumbnail_url=m.get("thumbnail_url") or m.get("thumbnail"),
+                             image_hash=m.get("image_hash") or "")
+                else:
+                    c.update(image_hash=m["image_hash"])
+                out.append(c)
+                continue
             theme = st.session_state.get(f"th{i}") or "네이비"
             photo = st.session_state.get(f"ph{i}")
             bg_path = ""
@@ -613,7 +751,8 @@ def creative_cards(variants: list[dict]) -> list[dict]:
             if v.get("rationale"):
                 st.caption(f"💡 {v['rationale']}")
             out.append({"name": f"{datetime.now():%y%m%d}_{v.get('angle', '')[:12]}_{i + 1}",
-                        "image_path": str(path), "primary_text": v["primary_text"], "headline": v["headline"],
+                        "image_path": str(path), "preview": str(path),
+                        "primary_text": v["primary_text"], "headline": v["headline"],
                         "description": v["description"], "cta": v["cta"]})
     return out
 
@@ -649,8 +788,11 @@ def step_confirm(w):
             check = meta.add_ads_to_adset(w["adset_id"], w["creatives"], dry_run=True)
         cols = st.columns(len(w["creatives"]))
         for col, c in zip(cols, w["creatives"]):
-            col.image(c["image_path"], width="stretch")
+            col.image(c.get("preview") or c.get("image_path"), width="stretch")
             col.caption(c["primary_text"][:80] + "…")
+        if any(c.get("video_id") or (c.get("image_hash") and not c.get("image_path")) for c in w["creatives"]):
+            st.warning("⚖️ 기존 사진·영상을 재사용한 소재가 있어요. 원본 영상 속 자막(전후 비교·후기 등)까지 "
+                       "심의 대상이에요 — 심의필 번호를 받은 뒤에만 집행하세요.")
         if check["ok"]:
             st.success("✅ 세팅 검증 통과 — **일시중지 상태로** 만들어져서, 아직 돈이 나가지 않아요.")
         else:
@@ -724,7 +866,7 @@ def page_budget():
         learn = st.slider("학습 보호 기간 (일)", 0, 14, 5)
     recs, summ = logic.optimize_budgets(DF, int(total * 100), int(reserve * 100), step / 100,
                                         cap_cents=meta.MAX_DAILY_BUDGET, min_spend=meta.MIN_SPEND,
-                                        learning_days=learn)
+                                        learning_days=learn, min_results=MIN_RESULTS)
     if recs.empty:
         st.info("집행 중인 캠페인이 없어요.")
         return
@@ -754,12 +896,72 @@ def page_budget():
         confirm_budget(items)
 
 
+# ═════════════════════════ 🔍 심층 분석 ═════════════════════════
+def seg_table(seg: pd.DataFrame, label: str, flags: list[dict]):
+    mark = {f["구간"]: f["판정"] for f in flags}
+    view = seg.assign(판정=seg[label].map(mark).fillna(""))
+    view = view[view["광고비"] >= 5]
+    st.dataframe(view[["판정", label, "광고비", "결과", "1건당 비용"]].rename(columns={"결과": "상담 신청"}),
+                 hide_index=True, width="stretch",
+                 column_config={"광고비": st.column_config.NumberColumn(format="$%.0f"),
+                                "1건당 비용": st.column_config.NumberColumn(format="$%.2f"),
+                                "상담 신청": st.column_config.NumberColumn(format="%d")})
+
+
+def page_analysis():
+    flash()
+    st.markdown("### 🔍 심층 분석")
+    st.caption("상담 신청 캠페인 최근 30일 기준 · 광고비가 충분한 구간만 🔴/🟢 판정해요")
+    with st.spinner("분석 중…"):
+        pl, ag = placement_frame(), age_frame()
+    t1, t2, t3 = st.tabs(["📍 노출 위치", "👥 나이·성별", "🏥 상담 → 내원"])
+    with t1:
+        f = logic.segment_flags(pl, "위치", min_spend=50, min_results=5)
+        for x in f:
+            (st.error if x["판정"] == "🔴" else st.success)(f"{x['판정']} **{x['구간']}** — {x['설명']} "
+                                                          f"(광고비 ${x['광고비']:.0f}, 상담 {x['결과']}건)")
+        seg_table(pl, "위치", f)
+        st.caption("💡 비싼 위치는 광고관리자 → 광고세트 → 노출 위치 → '수동'에서 뺄 수 있어요.")
+    with t2:
+        f = logic.segment_flags(ag, "구간", min_spend=80, min_results=10)
+        for x in f:
+            (st.error if x["판정"] == "🔴" else st.success)(f"{x['판정']} **{x['구간']}** — {x['설명']} "
+                                                          f"(광고비 ${x['광고비']:.0f}, 상담 {x['결과']}건)")
+        seg_table(ag, "구간", f)
+        st.caption("💡 상담 신청 단가만 보고 나이대를 빼지 마세요. 실제 내원율이 다를 수 있어요 → '상담 → 내원' 탭")
+    with t3:
+        oc = logic.outcome_by_campaign(CONSULT_DB)
+        if oc.empty:
+            st.info("상담 통합 대시보드에 메타광고 리드가 아직 없어요. 상담 대시보드를 한 번 열어 동기화해 주세요.")
+        else:
+            tot = oc.sum()
+            c = st.columns(5)
+            for col, (lbl, key) in zip(c, [("리드", "리드DB"), ("결과 기록", "기록됨"), ("예약", "예약"),
+                                           ("내원", "내원"), ("수술확정", "수술")]):
+                col.metric(lbl, f"{int(tot[key]):,}건",
+                           f"{tot[key] / tot['리드DB']:.0%}" if key != "리드DB" and tot["리드DB"] else None,
+                           delta_color="off")
+            names = {**NAME, "-": "(캠페인 정보 없음)"}
+            all_names = {c["id"]: c["name"] for c in meta.list_campaigns(limit=200)}
+            view = oc.assign(캠페인=[names.get(i) or all_names.get(i, i) for i in oc.index])
+            view["내원율"] = view["내원"] / view["리드DB"]
+            st.dataframe(view[["캠페인", "리드DB", "기록됨", "예약", "내원", "수술", "무효", "내원율"]]
+                         .rename(columns={"리드DB": "리드", "기록됨": "기록"}).sort_values("리드", ascending=False),
+                         hide_index=True, width="stretch",
+                         column_config={"내원율": st.column_config.ProgressColumn(format="percent",
+                                                                                  min_value=0, max_value=1)})
+            if not tot["기록됨"]:
+                st.warning("아직 결과가 하나도 기록되지 않았어요. 상담 통합 대시보드 표의 **상태 ✏️** 칸에서 "
+                           "예약·내원·수술확정·무효를 골라 주세요.")
+
+
 # ═════════════════════════ 네비게이션 ═════════════════════════
 PAGES = {
     "home": st.Page(page_home, title="오늘 할 일", icon="🏠", default=True),
     "camps": st.Page(page_campaigns, title="캠페인", icon="📋", url_path="campaigns"),
     "new": st.Page(page_new, title="새 광고 만들기", icon="✨", url_path="new"),
     "budget": st.Page(page_budget, title="예산 재배분", icon="⚖️", url_path="budget"),
+    "analysis": st.Page(page_analysis, title="심층 분석", icon="🔍", url_path="analysis"),
 }
 with st.sidebar:
     st.markdown(f"**{OV['account']['name']}**  \n<span class='muted'>{OV['page'].get('name')} · "

@@ -51,8 +51,20 @@ def campaign_frame(campaigns: list[dict], insights: list[dict]) -> pd.DataFrame:
             "CPM($)": round(float(r.get("cpm", 0) or 0), 2),
             "결과": int(results), "결과명": res_name, "단가명": cost_name,
             "단가($)": round(spend / results, 3) if results else None,
+            # 트래픽 캠페인은 홈페이지 전환(픽셀 상담신청 등)이 잡혀야 '실제 성과'를 판단할 수 있음
+            "전환측정": obj != "OUTCOME_TRAFFIC" or has_site_conversion(r),
         })
     return pd.DataFrame(rows)
+
+
+SITE_CONVERSION_PREFIXES = ("offsite_conversion.fb_pixel_lead", "offsite_conversion.fb_pixel_complete_registration",
+                            "offsite_conversion.fb_pixel_contact", "offsite_conversion.fb_pixel_schedule",
+                            "offsite_conversion.fb_pixel_submit_application", "offsite_conversion.custom.")
+
+
+def has_site_conversion(row: dict) -> bool:
+    return any(a.get("action_type", "").startswith(SITE_CONVERSION_PREFIXES) and float(a.get("value", 0)) > 0
+               for a in row.get("actions") or [])
 
 
 def group_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -85,13 +97,16 @@ class BudgetRec:
 
 def optimize_budgets(df: pd.DataFrame, total_cents: int, reserve_cents: int = 0, max_step: float = 0.2,
                      min_cents: int = 500, cap_cents: int = 10**9, min_spend: float = 10.0,
-                     learning_days: int = 3, exponent: float = 0.7) -> tuple[pd.DataFrame, dict]:
+                     learning_days: int = 3, exponent: float = 0.7,
+                     min_results: int = 0) -> tuple[pd.DataFrame, dict]:
     """목표 그룹(리드/트래픽…) 안에서만 효율을 비교해 총예산을 재배분한다.
 
     - 학습 중(운영일수 < learning_days)이거나 지출이 min_spend 미만이면 고정
     - 지출이 충분한데 결과 0 → 중지 제안
     - 나머지는 (그룹 평균단가 / 캠페인 단가)^exponent 비율로 조정하되 1회 변경폭은 ±max_step
     - 그룹 간 예산 비율은 현재 비율을 유지 (리드 단가와 트래픽 단가는 비교 불가)
+    - 홈페이지 전환이 측정되지 않는 트래픽 캠페인은 '측정 불가'로 고정 (방문 단가는 허상 지표)
+    - 결과가 min_results 미만이면 우연일 수 있어 고정
     """
     act = df[(df["상태"] == "ACTIVE") & (df["일예산($)"] > 0)].copy()
     if act.empty:
@@ -103,15 +118,19 @@ def optimize_budgets(df: pd.DataFrame, total_cents: int, reserve_cents: int = 0,
 
     for grp, gdf in act.groupby("그룹"):
         g_target = avail * gdf["cur"].sum() / cur_total
-        valid = gdf[(gdf["결과"] > 0)]
+        valid = gdf[(gdf["결과"] > 0) & gdf.get("전환측정", True)]
         g_avg = valid["지출($)"].sum() / valid["결과"].sum() if not valid.empty else None
         locked, flex = {}, {}
         for _, r in gdf.iterrows():
             cur = int(r["cur"])
-            if r["운영일수"] < learning_days or r["지출($)"] < min_spend:
+            if not r.get("전환측정", True):
+                locked[r["id"]] = (cur, "유지", "측정 불가 — 홈페이지 상담 신청이 집계되지 않아 효율을 판단할 수 없어요")
+            elif r["운영일수"] < learning_days or r["지출($)"] < min_spend:
                 locked[r["id"]] = (cur, "유지", f"아직 판단 일러요 (시작 {r['운영일수']}일째, 광고비 ${r['지출($)']:.0f})")
             elif r["결과"] == 0:
                 locked[r["id"]] = (0, "중지 제안", f"광고비 ${r['지출($)']:.0f} 썼는데 {r['결과명']} 0건")
+            elif r["결과"] < min_results:
+                locked[r["id"]] = (cur, "유지", f"{r['결과명']} {r['결과']}건 — {min_results}건 이상 쌓여야 믿을 수 있어요")
             elif g_avg is None:
                 locked[r["id"]] = (cur, "유지", "비교할 그룹 평균 없음")
             else:
@@ -172,14 +191,19 @@ PLAIN = {  # 그룹 → (결과 이름, 단가 이름)
 GROUP_NAME = {"잠재고객": "상담 신청 캠페인", "트래픽": "홈페이지 방문 캠페인"}
 
 
-def verdict(row, group_avg: float | None, learning_days: int = 5, min_spend: float = 10.0) -> tuple[str, str]:
+def verdict(row, group_avg: float | None, learning_days: int = 5, min_spend: float = 10.0,
+            min_results: int = 0) -> tuple[str, str]:
     """(아이콘+라벨, 한 줄 설명)."""
+    if not row.get("전환측정", True):
+        return "⚪ 측정 불가", "상담 신청으로 이어졌는지 집계 안 됨"
     if row["운영일수"] < learning_days:
         return "⏳ 학습 중", f"시작 {row['운영일수']}일째 — {learning_days}일까지는 지켜보기"
     if row["지출($)"] < min_spend:
         return "⚪ 데이터 부족", f"지출 ${row['지출($)']:.0f} — 판단하기엔 아직 적어요"
     if row["결과"] == 0:
         return "🔴 성과 없음", f"${row['지출($)']:.0f} 썼는데 {PLAIN.get(row['그룹'], ('결과',))[0]} 0건"
+    if row["결과"] < min_results:
+        return "⚪ 데이터 부족", f"{PLAIN.get(row['그룹'], ('결과',))[0]} {row['결과']}건 — {min_results}건 이상 필요"
     if not group_avg:
         return "⚪ 비교 불가", ""
     r = row["단가($)"] / group_avg
@@ -250,9 +274,105 @@ def build_todos(df: pd.DataFrame, recs: pd.DataFrame, ad_flags: dict[str, list[d
                           "새 소재 만들기",
                           {"campaign_id": cid, "name": c["캠페인"], "bad_ads": [a["ad_id"] for a in bad],
                            "bad_names": [a["ad"] for a in bad], "adset_id": bad[0].get("adset_id")}))
+    blind = df[(df["상태"] == "ACTIVE") & (~df["전환측정"])] if "전환측정" in df else df.iloc[0:0]
+    if not blind.empty:
+        todos.append(Todo("measure", 0, "measure", "📏",
+                          f"홈페이지 방문 캠페인 {len(blind)}개 — 성과를 측정할 수 없어요",
+                          f"하루 ${blind['일예산($)'].sum():.0f}를 쓰는데, 홈페이지에서 상담 신청이 몇 건 나왔는지 "
+                          "Meta가 모르고 있어요. 홈페이지에 '상담 신청 완료' 이벤트를 설치해야 해요.",
+                          "설치 가이드 보기", {}))
     learning = df[(df["상태"] == "ACTIVE") & (df["운영일수"] < 5)]
     for _, c in learning.iterrows():
         todos.append(Todo(f"wait_{c['id']}", 9, "wait", "⏳", f"{c['캠페인']} — 학습 중",
                           f"시작 {c['운영일수']}일째예요. 5일 정도는 예산·소재를 바꾸지 말고 지켜보세요.",
                           "", {}))
     return sorted(todos, key=lambda t: t.priority)
+
+
+# ───────────────────────── 상담 결과(내원·수술) ─────────────────────────
+VISIT_STATES = ("내원", "수술확정", "완료")
+BOOK_STATES = ("예약",) + VISIT_STATES
+WORKED_STATES = ("상담중", "무효(부재·중복)") + BOOK_STATES  # '신규'가 아닌 것 = 결과 기록됨
+
+
+def outcome_by_campaign(db_path: str, since: str = "", until: str = "") -> pd.DataFrame:
+    """상담 통합 대시보드 DB 의 메타광고 리드 → 캠페인별 예약/내원/수술 수."""
+    import json
+    import sqlite3
+    from pathlib import Path
+    if not Path(db_path).exists():
+        return pd.DataFrame()
+    sql = "SELECT status, raw, received_at FROM consultations WHERE channel_key = 'meta_ads'"
+    params = []
+    if since:
+        sql += " AND received_at >= ?"
+        params.append(since)
+    if until:
+        sql += " AND received_at < ?"
+        params.append(until + "T23:59:59")
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = con.execute(sql, params).fetchall()
+    finally:
+        con.close()
+    agg: dict = {}
+    for status, raw, _ in rows:
+        cid = (json.loads(raw or "{}") or {}).get("campaign_id") or "-"
+        a = agg.setdefault(cid, {"리드DB": 0, "기록됨": 0, "예약": 0, "내원": 0, "수술": 0, "무효": 0})
+        a["리드DB"] += 1
+        a["기록됨"] += status in WORKED_STATES
+        a["예약"] += status in BOOK_STATES
+        a["내원"] += status in VISIT_STATES
+        a["수술"] += status == "수술확정"
+        a["무효"] += status == "무효(부재·중복)"
+    return pd.DataFrame.from_dict(agg, orient="index")
+
+
+# ───────────────────────── 세그먼트(위치·연령) 분석 ─────────────────────────
+def segment_frame(rows: list[dict], keys: tuple[str, ...], result_key: str = "lead") -> pd.DataFrame:
+    agg: dict = {}
+    for r in rows:
+        k = tuple(r.get(x, "") for x in keys)
+        a = agg.setdefault(k, [0.0, 0.0])
+        a[0] += float(r.get("spend", 0) or 0)
+        a[1] += action_value(r, result_key)
+    out = pd.DataFrame([(*k, sp, res) for k, (sp, res) in agg.items()], columns=[*keys, "광고비", "결과"])
+    out["1건당 비용"] = (out["광고비"] / out["결과"]).where(out["결과"] > 0)
+    return out.sort_values("광고비", ascending=False)
+
+
+PLACEMENT_KO = {
+    ("instagram", "instagram_reels"): "인스타 릴스", ("instagram", "feed"): "인스타 피드",
+    ("instagram", "instagram_stories"): "인스타 스토리", ("instagram", "instagram_explore"): "인스타 탐색",
+    ("instagram", "instagram_explore_grid_home"): "인스타 탐색 홈", ("instagram", "instagram_profile_feed"): "인스타 프로필",
+    ("facebook", "facebook_reels"): "페북 릴스", ("facebook", "feed"): "페북 피드",
+    ("facebook", "facebook_stories"): "페북 스토리", ("facebook", "facebook_reels_overlay"): "페북 릴스 오버레이",
+    ("facebook", "marketplace"): "페북 마켓플레이스", ("facebook", "video_feeds"): "페북 동영상 피드",
+    ("audience_network", "classic"): "Audience Network", ("audience_network", "rewarded_video"): "Audience Network 보상형",
+    ("threads", "threads_feed"): "스레드",
+}
+
+
+def segment_flags(seg: pd.DataFrame, label_col: str, min_spend: float = 50.0, min_results: int = 0,
+                  bad: float = 1.5, good: float = 0.8) -> list[dict]:
+    """평균 대비 비싼/싼 구간. 광고비가 충분한 구간만 판단."""
+    tot_sp, tot_res = seg["광고비"].sum(), seg["결과"].sum()
+    if not tot_res:
+        return []
+    avg = tot_sp / tot_res
+    out = []
+    for _, r in seg.iterrows():
+        if r["광고비"] < min_spend:
+            continue
+        if r["결과"] == 0:
+            out.append({"구간": r[label_col], "판정": "🔴", "광고비": r["광고비"], "결과": 0, "단가": None,
+                        "설명": f"${r['광고비']:.0f} 썼는데 결과 0건"})
+        elif r["결과"] >= min_results:
+            ratio = r["1건당 비용"] / avg
+            if ratio >= bad:
+                out.append({"구간": r[label_col], "판정": "🔴", "광고비": r["광고비"], "결과": int(r["결과"]),
+                            "단가": r["1건당 비용"], "설명": f"평균(${avg:.2f})의 {ratio:.1f}배"})
+            elif ratio <= good:
+                out.append({"구간": r[label_col], "판정": "🟢", "광고비": r["광고비"], "결과": int(r["결과"]),
+                            "단가": r["1건당 비용"], "설명": f"평균(${avg:.2f})보다 {int((1 - ratio) * 100)}% 저렴"})
+    return out
