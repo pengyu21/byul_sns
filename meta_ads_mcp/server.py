@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import statistics
 from datetime import datetime
@@ -31,6 +32,9 @@ PIXEL_ID = os.getenv("META_PIXEL_ID", "").strip()
 IG_USER_ID = os.getenv("META_INSTAGRAM_USER_ID", "").strip()
 MAX_DAILY_BUDGET = int(os.getenv("MAX_DAILY_BUDGET", "50000"))
 DEFAULT_COUNTRY = os.getenv("DEFAULT_COUNTRY", "KR")
+MIN_SPEND = float(os.getenv("MIN_SPEND_FOR_JUDGEMENT", "10"))
+# 통화별 최소단위 배수: 예산 API 값 = 금액 × offset (USD 3000 = $30, KRW/JPY 는 그대로)
+ZERO_DECIMAL = {"KRW", "JPY", "TWD", "CLP", "COP", "HUF", "ISK", "IDR", "VND", "PYG"}
 
 CREATIVE_DIR = ROOT / "creatives"
 RUNS_DIR = ROOT / "runs"
@@ -48,6 +52,11 @@ CTAS = {
 }
 
 mcp = FastMCP("meta-ads")
+
+# 요청 URL(페이지네이션 next 링크에는 토큰 포함)이 로그에 남지 않도록 차단
+for _name in ("httpx", "httpcore"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
 # ───────────────────────── Graph API helper ─────────────────────────
@@ -70,8 +79,7 @@ def _api(method: str, path: str, params: dict | None = None, data: dict | None =
         raise MetaError("META_ACCESS_TOKEN 이 .env 에 없습니다. SETUP.md 를 참고해 설정하세요.")
     url = path if path.startswith("http") else f"{GRAPH}/{path.lstrip('/')}"
     q = _enc(params)
-    q["access_token"] = TOKEN
-    with httpx.Client(timeout=90) as c:
+    with httpx.Client(timeout=90, headers=AUTH) as c:
         r = c.request(method, url, params=q, data=_enc(data) or None, files=files)
     try:
         body = r.json()
@@ -98,6 +106,12 @@ def _get_all(path: str, params: dict, max_pages: int = 10) -> list:
             body = c.get(nxt).json()
         rows += body.get("data", [])
     return rows
+
+
+def _human(minor: int, currency: str | None) -> str:
+    if currency in ZERO_DECIMAL:
+        return f"{minor:,} {currency}"
+    return f"{minor / 100:,.2f} {currency or ''}".strip()
 
 
 def _need_account():
@@ -129,7 +143,9 @@ def account_overview() -> dict:
         "instagram_user_id": IG_USER_ID or None,
         "guardrails": {"max_daily_budget": MAX_DAILY_BUDGET, "created_status": "PAUSED"},
         "api_version": API_VERSION,
-        "note": "KRW 계정은 예산 단위가 '원' 그대로입니다 (USD 계정은 센트 단위).",
+        "budget_unit": ("원 그대로 (30000 = ₩30,000)" if acct.get("currency") in ZERO_DECIMAL
+                        else f"최소단위 ×100 (3000 = 30 {acct.get('currency')})"),
+        "max_daily_budget_human": _human(MAX_DAILY_BUDGET, acct.get("currency")),
     }
 
 
@@ -323,7 +339,7 @@ def _validate(plan: dict) -> tuple[list[str], list[str]]:
         errs.append(f"{obj} 는 META_PIXEL_ID 가 필요함 (없으면 OUTCOME_TRAFFIC 사용)")
     b = plan.get("daily_budget")
     if not isinstance(b, int) or b <= 0:
-        errs.append("daily_budget 은 양의 정수(계정 통화 최소단위, KRW=원)")
+        errs.append("daily_budget 은 양의 정수(계정 통화 최소단위: USD=센트, KRW=원)")
     elif b > MAX_DAILY_BUDGET:
         errs.append(f"daily_budget {b:,} 이 상한 MAX_DAILY_BUDGET {MAX_DAILY_BUDGET:,} 초과")
     link = plan.get("link", "")
@@ -361,7 +377,7 @@ def launch_campaign(plan: dict, dry_run: bool = True) -> dict:
     {
       "name": "봄시즌_트래픽_2611",
       "objective": "OUTCOME_TRAFFIC",            # TRAFFIC|SALES|LEADS|AWARENESS|ENGAGEMENT
-      "daily_budget": 30000,                     # KRW 원 단위, 캠페인 예산(CBO)
+      "daily_budget": 30000,                     # 통화 최소단위(USD 센트: 3000=$30 / KRW 원), 캠페인 예산(CBO)
       "link": "https://example.com/landing",
       "special_ad_categories": [],               # 신용/고용/주거/정치 광고면 지정
       "adsets": [
@@ -534,9 +550,10 @@ def _action(row: dict, key: str, field: str = "actions") -> float:
 
 @mcp.tool()
 def analyze_performance(date_preset: str = "last_7d", campaign_id: str = "",
-                        min_spend: int = 10000, result_action: str = "") -> dict:
+                        min_spend: float = 0, result_action: str = "") -> dict:
     """광고 단위 성과를 분석해 PAUSE/SCALE/소재교체 후보를 제안한다(실행은 하지 않음).
-    min_spend: 판단에 필요한 최소 지출(KRW). result_action 비우면 구매>리드>LPV>링크클릭 순 자동 선택."""
+    min_spend: 판단에 필요한 최소 지출(계정 통화 기본단위, USD=달러; 0이면 .env MIN_SPEND_FOR_JUDGEMENT). result_action 비우면 구매>리드>LPV>링크클릭 순 자동 선택."""
+    min_spend = min_spend or MIN_SPEND
     rows = get_insights("ad", date_preset, campaign_id)
     if not rows:
         return {"message": "해당 기간 데이터 없음"}
@@ -549,10 +566,10 @@ def analyze_performance(date_preset: str = "last_7d", campaign_id: str = "",
         res = _action(r, result_action)
         ads.append({
             "ad_id": r["ad_id"], "ad": r.get("ad_name"), "adset": r.get("adset_name"),
-            "spend": round(spend), "impr": int(r.get("impressions", 0)),
+            "spend": round(spend, 2), "impr": int(r.get("impressions", 0)),
             "link_ctr": round(float(r.get("inline_link_click_ctr", 0) or 0), 2),
             "freq": round(float(r.get("frequency", 0) or 0), 2),
-            "results": int(res), "cpa": round(spend / res) if res else None,
+            "results": int(res), "cpa": round(spend / res, 2) if res else None,
             "roas": round(_action(r, "omni_purchase", "purchase_roas") or
                           _action(r, "offsite_conversion.fb_pixel_purchase", "purchase_roas"), 2) or None,
         })
@@ -566,7 +583,7 @@ def analyze_performance(date_preset: str = "last_7d", campaign_id: str = "",
             flags.append("PAUSE: 지출 대비 결과 0")
         if med and a["cpa"] and enough:
             if a["cpa"] >= med * 1.5:
-                flags.append(f"PAUSE: CPA 중앙값({med:,.0f})의 1.5배 이상")
+                flags.append(f"PAUSE: CPA 중앙값({med:,.2f})의 1.5배 이상")
             elif a["cpa"] <= med * 0.7:
                 flags.append("SCALE: CPA 우수 — 해당 광고세트 예산 증액/유사 소재 추가")
         if a["impr"] >= 2000 and a["link_ctr"] < 0.7:
@@ -577,7 +594,7 @@ def analyze_performance(date_preset: str = "last_7d", campaign_id: str = "",
     ads.sort(key=lambda a: (a["cpa"] is None, a["cpa"] or 0))
     return {
         "result_action": result_action, "median_cpa": med, "min_spend": min_spend,
-        "total_spend": sum(a["spend"] for a in ads), "total_results": sum(a["results"] for a in ads),
+        "total_spend": round(sum(a["spend"] for a in ads), 2), "total_results": sum(a["results"] for a in ads),
         "ads": ads,
     }
 
