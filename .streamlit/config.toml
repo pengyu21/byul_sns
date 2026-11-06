@@ -3,8 +3,12 @@
 address = "localhost"
 port = 8502
 
+[client]
+toolbarMode = "minimal"
+
 [browser]
 gatherUsageStats = false
 
 [theme]
 base = "light"
+primaryColor = "#2a78d6"

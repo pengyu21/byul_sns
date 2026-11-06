@@ -643,11 +643,14 @@ INSIGHT_FIELDS = ("campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,s
 
 @mcp.tool()
 def get_insights(level: str = "ad", date_preset: str = "last_7d", object_id: str = "",
-                 breakdowns: str = "", daily: bool = False) -> list:
+                 breakdowns: str = "", daily: bool = False, since: str = "", until: str = "") -> list:
     """성과 데이터 조회. level: campaign|adset|ad. date_preset: today|yesterday|last_3d|last_7d|last_14d|last_30d|this_month.
     breakdowns 예: 'age,gender' 또는 'publisher_platform'. object_id 비우면 계정 전체."""
     _need_account()
     params = {"level": level, "date_preset": date_preset, "fields": INSIGHT_FIELDS, "limit": 200}
+    if since and until:  # YYYY-MM-DD 범위가 주어지면 date_preset 대신 사용
+        params.pop("date_preset")
+        params["time_range"] = {"since": since, "until": until}
     if breakdowns:
         params["breakdowns"] = breakdowns
     if daily:

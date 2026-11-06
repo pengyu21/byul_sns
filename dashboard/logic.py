@@ -109,9 +109,9 @@ def optimize_budgets(df: pd.DataFrame, total_cents: int, reserve_cents: int = 0,
         for _, r in gdf.iterrows():
             cur = int(r["cur"])
             if r["운영일수"] < learning_days or r["지출($)"] < min_spend:
-                locked[r["id"]] = (cur, "유지", f"학습/데이터 부족 (운영 {r['운영일수']}일, 지출 ${r['지출($)']:.0f})")
+                locked[r["id"]] = (cur, "유지", f"아직 판단 일러요 (시작 {r['운영일수']}일째, 광고비 ${r['지출($)']:.0f})")
             elif r["결과"] == 0:
-                locked[r["id"]] = (0, "중지 제안", f"지출 ${r['지출($)']:.0f} 동안 {r['결과명']} 0건")
+                locked[r["id"]] = (0, "중지 제안", f"광고비 ${r['지출($)']:.0f} 썼는데 {r['결과명']} 0건")
             elif g_avg is None:
                 locked[r["id"]] = (cur, "유지", "비교할 그룹 평균 없음")
             else:
@@ -144,10 +144,12 @@ def optimize_budgets(df: pd.DataFrame, total_cents: int, reserve_cents: int = 0,
                 new = int(round(tgt[cid] / 100) * 100)
                 pct = (new - cur) / cur * 100
                 action = "증액" if pct >= 2 else "감액" if pct <= -2 else "유지"
-                why = (f"{r['단가명']} ${r['단가($)']:.2f} vs 그룹평균 ${g_avg:.2f} "
-                       f"({'효율 좋음' if ratio > 1 else '효율 낮음'} ×{ratio:.2f}) → {pct:+.0f}%")
+                unit = PLAIN.get(grp, ("결과", "1건당 비용"))[1]
+                diff = abs(1 / ratio - 1) * 100
+                why = (f"{unit} ${r['단가($)']:.2f} — 평균(${g_avg:.2f})보다 "
+                       f"{diff:.0f}% {'저렴해요' if ratio > 1 else '비싸요'}")
                 if ratio < 0.5:
-                    why += " · 소재 교체 권장"
+                    why += " · 소재 교체도 권해요"
             recs.append(BudgetRec(cid, r["캠페인"], grp, int(r["cur"]), new, action, why))
 
     out = pd.DataFrame([asdict(r) for r in recs])
@@ -157,3 +159,100 @@ def optimize_budgets(df: pd.DataFrame, total_cents: int, reserve_cents: int = 0,
         "제안합계": proposed, "미배정": total_cents - reserve_cents - proposed,
     }
     return out, summary
+
+
+# ───────────────────────── 쉬운 말 / 판정 / 할 일 ─────────────────────────
+PLAIN = {  # 그룹 → (결과 이름, 단가 이름)
+    "잠재고객": ("상담 신청", "상담 1건당 비용"),
+    "트래픽": ("홈페이지 방문", "방문 1회당 비용"),
+    "판매": ("구매", "구매 1건당 비용"),
+    "참여": ("참여", "참여 1회당 비용"),
+    "인지도": ("도달", "도달 1명당 비용"),
+}
+GROUP_NAME = {"잠재고객": "상담 신청 캠페인", "트래픽": "홈페이지 방문 캠페인"}
+
+
+def verdict(row, group_avg: float | None, learning_days: int = 5, min_spend: float = 10.0) -> tuple[str, str]:
+    """(아이콘+라벨, 한 줄 설명)."""
+    if row["운영일수"] < learning_days:
+        return "⏳ 학습 중", f"시작 {row['운영일수']}일째 — {learning_days}일까지는 지켜보기"
+    if row["지출($)"] < min_spend:
+        return "⚪ 데이터 부족", f"지출 ${row['지출($)']:.0f} — 판단하기엔 아직 적어요"
+    if row["결과"] == 0:
+        return "🔴 성과 없음", f"${row['지출($)']:.0f} 썼는데 {PLAIN.get(row['그룹'], ('결과',))[0]} 0건"
+    if not group_avg:
+        return "⚪ 비교 불가", ""
+    r = row["단가($)"] / group_avg
+    if r <= 0.8:
+        return "🟢 효율 좋음", f"평균보다 {int((1 - r) * 100)}% 저렴"
+    if r >= 1.25:
+        return "🔴 개선 필요", f"평균보다 {int((r - 1) * 100)}% 비쌈"
+    return "🟡 보통", "평균 수준"
+
+
+@dataclass
+class Todo:
+    key: str
+    priority: int            # 낮을수록 먼저
+    kind: str                # budget | pause_campaign | creative | pause_ads | wait
+    icon: str
+    title: str
+    detail: str
+    button: str
+    payload: dict
+
+
+def build_todos(df: pd.DataFrame, recs: pd.DataFrame, ad_flags: dict[str, list[dict]],
+                group_avg: dict[str, float], min_change: float = 0.1) -> list[Todo]:
+    """예산 재배분 제안 + 광고 진단 → 우선순위가 매겨진 할 일 카드."""
+    todos: list[Todo] = []
+    by_id = df.set_index("id")
+    if not recs.empty:
+        for _, r in recs.iterrows():
+            c = by_id.loc[r["id"]]
+            res_name, cost_name = PLAIN.get(c["그룹"], ("결과", "단가"))
+            avg = group_avg.get(c["그룹"])
+            if r["제안"] == 0:
+                todos.append(Todo(f"pause_{r['id']}", 0, "pause_campaign", "⛔",
+                                  f"{c['캠페인']} — 성과가 없어요",
+                                  f"${c['지출($)']:.0f}를 썼는데 {res_name}이 0건이에요. 캠페인을 끄는 걸 권해요.",
+                                  "캠페인 끄기", {"id": r["id"], "name": c["캠페인"]}))
+            elif abs(r["제안"] - r["현재"]) / r["현재"] < min_change:
+                continue  # 자잘한 조정은 할 일에 띄우지 않음 (예산 재배분 화면에서만)
+            elif r["제안"] < r["현재"]:
+                pct = (r["현재"] - r["제안"]) / r["현재"] * 100
+                todos.append(Todo(f"down_{r['id']}", 1 if pct >= 15 else 3, "budget", "🔻",
+                                  f"{c['캠페인']} — 비용이 비싸요",
+                                  f"{cost_name} ${c['단가($)']:.2f} (평균 ${avg:.2f}). "
+                                  f"예산을 줄여 효율 좋은 캠페인으로 옮기세요.",
+                                  f"예산 ${r['현재'] / 100:.0f} → ${r['제안'] / 100:.0f} 줄이기",
+                                  {"id": r["id"], "name": c["캠페인"], "from": int(r["현재"]), "to": int(r["제안"])}))
+            elif r["제안"] > r["현재"]:
+                pct = (r["제안"] - r["현재"]) / r["현재"] * 100
+                todos.append(Todo(f"up_{r['id']}", 2 if pct >= 10 else 4, "budget", "🔺",
+                                  f"{c['캠페인']} — 효율이 좋아요",
+                                  f"{cost_name} ${c['단가($)']:.2f} (평균 ${avg:.2f}). 예산을 늘려 {res_name}을 더 받으세요.",
+                                  f"예산 ${r['현재'] / 100:.0f} → ${r['제안'] / 100:.0f} 늘리기",
+                                  {"id": r["id"], "name": c["캠페인"], "from": int(r["현재"]), "to": int(r["제안"])}))
+    for cid, ads in ad_flags.items():
+        if cid not in by_id.index:
+            continue
+        c = by_id.loc[cid]
+        bad = [a for a in ads if any(f.startswith(("PAUSE", "CREATIVE", "FATIGUE")) for f in a["flags"])]
+        if not bad:
+            continue
+        fatigue = any(any(f.startswith("FATIGUE") for f in a["flags"]) for a in bad)
+        todos.append(Todo(f"creative_{cid}", 2, "creative", "🎨",
+                          f"{c['캠페인']} — 소재 {len(bad)}개가 힘이 빠졌어요",
+                          ("같은 사람에게 너무 자주 노출되고 있어요. " if fatigue else
+                           "클릭률이 낮거나 비용이 높은 소재가 있어요. ")
+                          + "약한 소재를 끄고 새 소재를 추가하세요.",
+                          "새 소재 만들기",
+                          {"campaign_id": cid, "name": c["캠페인"], "bad_ads": [a["ad_id"] for a in bad],
+                           "bad_names": [a["ad"] for a in bad], "adset_id": bad[0].get("adset_id")}))
+    learning = df[(df["상태"] == "ACTIVE") & (df["운영일수"] < 5)]
+    for _, c in learning.iterrows():
+        todos.append(Todo(f"wait_{c['id']}", 9, "wait", "⏳", f"{c['캠페인']} — 학습 중",
+                          f"시작 {c['운영일수']}일째예요. 5일 정도는 예산·소재를 바꾸지 말고 지켜보세요.",
+                          "", {}))
+    return sorted(todos, key=lambda t: t.priority)
