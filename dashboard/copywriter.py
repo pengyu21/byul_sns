@@ -82,6 +82,7 @@ def available() -> bool:
 def _user_prompt(brief: dict, winners: list[dict], losers: list[dict], n: int) -> str:
     return (
         f"## 광고 브리프\n{json.dumps(brief, ensure_ascii=False, indent=2)}\n\n"
+        "(단가·지출 단위는 미국 달러 USD. 원화로 표기하지 말 것)\n\n"
         f"## 성과 좋은 기존 소재 (단가 낮은 순)\n{json.dumps(winners, ensure_ascii=False, indent=2)}\n\n"
         f"## 성과 나쁜 기존 소재\n{json.dumps(losers, ensure_ascii=False, indent=2)}\n\n"
         f"위 데이터를 분석해 서로 다른 앵글의 신규 소재 {n}개를 만들어 주세요."
