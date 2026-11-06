@@ -68,6 +68,8 @@ description: 페이스북/인스타그램(Meta) 유료광고를 브리프 하나
 
 ## 6. 원클릭 세팅
 1. plan JSON을 구성한다. 이름 규칙(기존 계정 컨벤션): `<YYMMDD>_<시술/상품>_<목표>` 예) `261106_코재수술_트래픽`
+   - 잠재고객 목표는 이 계정에서 **인스턴트 양식**(페이스북 내 상담신청서)이 효율이 가장 좋다. `list_lead_forms`로 양식을 고르고 plan에 `"lead_form_id"`를 넣으면 픽셀 없이 리드 최적화로 세팅된다
+   - 기존 광고세트에 소재만 추가하려면 `add_ads_to_adset`, 참고할 기존 문구는 `list_ads_with_creatives`
 2. `launch_campaign(plan, dry_run=true)` → errors가 있으면 고쳐서 다시 실행한다
 3. 사용자에게 **요약표**를 보여준다: 예산, 광고세트별 타겟과 예상 도달 규모, 소재 3개(카피 + 이미지 경로), 생성될 광고 수
 4. 바로 `launch_campaign(plan, dry_run=false)`를 실행한다. 모든 항목이 **PAUSED 상태로 생성되므로 과금은 없다**

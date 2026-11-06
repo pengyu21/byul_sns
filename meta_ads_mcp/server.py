@@ -31,6 +31,8 @@ PAGE_ID = os.getenv("META_PAGE_ID", "").strip()
 PIXEL_ID = os.getenv("META_PIXEL_ID", "").strip()
 IG_USER_ID = os.getenv("META_INSTAGRAM_USER_ID", "").strip()
 MAX_DAILY_BUDGET = int(os.getenv("MAX_DAILY_BUDGET", "50000"))
+# 집행 중인 모든 캠페인 일예산 합계 상한 (0 = 검사 안 함)
+MAX_TOTAL_DAILY_BUDGET = int(os.getenv("MAX_TOTAL_DAILY_BUDGET", "0"))
 DEFAULT_COUNTRY = os.getenv("DEFAULT_COUNTRY", "KR")
 MIN_SPEND = float(os.getenv("MIN_SPEND_FOR_JUDGEMENT", "10"))
 # 통화별 최소단위 배수: 예산 API 값 = 금액 × offset (USD 3000 = $30, KRW/JPY 는 그대로)
@@ -335,7 +337,7 @@ def _validate(plan: dict) -> tuple[list[str], list[str]]:
     obj = plan.get("objective")
     if obj not in OBJECTIVES:
         errs.append(f"objective 는 {sorted(OBJECTIVES)} 중 하나여야 함 (입력: {obj})")
-    if obj in ("OUTCOME_SALES", "OUTCOME_LEADS") and not PIXEL_ID:
+    if obj in ("OUTCOME_SALES", "OUTCOME_LEADS") and not PIXEL_ID and not plan.get("lead_form_id"):
         errs.append(f"{obj} 는 META_PIXEL_ID 가 필요함 (없으면 OUTCOME_TRAFFIC 사용)")
     b = plan.get("daily_budget")
     if not isinstance(b, int) or b <= 0:
@@ -399,6 +401,9 @@ def launch_campaign(plan: dict, dry_run: bool = True) -> dict:
 
     obj = plan["objective"]
     goal, promoted, dest = _goal_for(obj)
+    form_id = plan.get("lead_form_id") if obj == "OUTCOME_LEADS" else None
+    if form_id:  # 인스턴트 양식(페이스북 내 상담신청서)
+        goal, promoted, dest = "LEAD_GENERATION", {"page_id": PAGE_ID}, "ON_AD"
     camp_payload = {
         "name": plan["name"], "objective": obj, "status": "PAUSED",
         "special_ad_categories": plan.get("special_ad_categories", []),
@@ -422,21 +427,7 @@ def launch_campaign(plan: dict, dry_run: bool = True) -> dict:
         adset_payloads.append(p)
 
     def creative_payload(c: dict, image_hash: str) -> dict:
-        link_data = {
-            "link": c.get("link", plan["link"]), "message": c["primary_text"],
-            "image_hash": image_hash,
-        }
-        if c.get("headline"):
-            link_data["name"] = c["headline"]
-        if c.get("description"):
-            link_data["description"] = c["description"]
-        cta = c.get("cta", "LEARN_MORE")
-        if cta != "NO_BUTTON":
-            link_data["call_to_action"] = {"type": cta, "value": {"link": link_data["link"]}}
-        spec = {"page_id": PAGE_ID, "link_data": link_data}
-        if IG_USER_ID:
-            spec["instagram_user_id"] = IG_USER_ID
-        return {"name": c.get("name", "creative"), "object_story_spec": spec}
+        return _creative_payload(c, image_hash, plan["link"], form_id)
 
     summary = {
         "campaign": camp_payload,
@@ -489,6 +480,134 @@ def launch_campaign(plan: dict, dry_run: bool = True) -> dict:
     }
 
 
+def _creative_payload(c: dict, image_hash: str, default_link: str, lead_form_id: str | None = None) -> dict:
+    link_data = {
+        "link": c.get("link") or default_link or (f"https://www.facebook.com/{PAGE_ID}" if lead_form_id else ""),
+        "message": c["primary_text"],
+        "image_hash": image_hash,
+    }
+    if c.get("headline"):
+        link_data["name"] = c["headline"]
+    if c.get("description"):
+        link_data["description"] = c["description"]
+    cta = c.get("cta", "LEARN_MORE")
+    if lead_form_id:
+        link_data["call_to_action"] = {"type": cta if cta != "NO_BUTTON" else "SIGN_UP",
+                                       "value": {"lead_gen_form_id": lead_form_id}}
+    elif cta != "NO_BUTTON":
+        link_data["call_to_action"] = {"type": cta, "value": {"link": link_data["link"]}}
+    spec = {"page_id": PAGE_ID, "link_data": link_data}
+    if IG_USER_ID:
+        spec["instagram_user_id"] = IG_USER_ID
+    return {"name": c.get("name", "creative"), "object_story_spec": spec}
+
+
+def _cta_value(spec: dict) -> dict:
+    for k in ("link_data", "video_data"):
+        v = ((spec.get(k) or {}).get("call_to_action") or {}).get("value") or {}
+        if v:
+            return v
+    return {}
+
+
+def _landing_of(adset_id: str) -> tuple[str, str]:
+    """광고세트 기존 광고에서 (랜딩 URL, 인스턴트 양식 ID) 를 찾는다."""
+    ads = _get_all(f"{adset_id}/ads", {"fields": "creative{object_story_spec}", "limit": 10}, 1)
+    link, form = "", ""
+    for a in ads:
+        spec = (a.get("creative") or {}).get("object_story_spec") or {}
+        v = _cta_value(spec)
+        link = link or (spec.get("link_data") or {}).get("link") or v.get("link", "")
+        form = form or v.get("lead_gen_form_id", "")
+    return link, form
+
+
+@mcp.tool()
+def list_lead_forms() -> list:
+    """계정의 잠재고객 광고에서 사용 중인 인스턴트 양식(상담신청서) 목록을 찾는다."""
+    camps = _get_all(f"{ACCOUNT}/campaigns", {"fields": "id,name,objective", "limit": 200}, 3)
+    forms: dict[str, dict] = {}
+    for c in camps:
+        if c.get("objective") != "OUTCOME_LEADS":
+            continue
+        for a in _get_all(f"{c['id']}/ads", {"fields": "creative{object_story_spec}", "limit": 25}, 1):
+            fid = _cta_value((a.get("creative") or {}).get("object_story_spec") or {}).get("lead_gen_form_id")
+            if fid and fid not in forms:
+                forms[fid] = {"id": fid, "used_in": c["name"]}
+    for fid, f in forms.items():
+        try:
+            f.update(_api("GET", fid, {"fields": "name,status,leads_count"}))
+        except MetaError:
+            pass
+    return list(forms.values())
+
+
+@mcp.tool()
+def add_ads_to_adset(adset_id: str, creatives: list[dict], link: str = "", dry_run: bool = True) -> dict:
+    """기존 광고세트에 새 소재(광고)를 PAUSED 로 추가한다. 승자 타겟에 신규 소재를 테스트할 때 사용.
+    creatives 형식은 launch_campaign 과 동일. link 를 비우면 기존 광고의 랜딩 URL 을 그대로 쓴다."""
+    if not PAGE_ID:
+        return {"ok": False, "errors": ["META_PAGE_ID 미설정"]}
+    found_link, form_id = _landing_of(adset_id)
+    link = link or found_link
+    errs = []
+    if not form_id and not str(link).startswith("https://"):
+        errs.append("랜딩 URL 을 찾지 못했습니다. link 를 직접 지정하세요.")
+    for i, c in enumerate(creatives):
+        if not (c.get("image_path") or c.get("image_hash")):
+            errs.append(f"creatives[{i}]: image_path 또는 image_hash 필요")
+        if not c.get("primary_text"):
+            errs.append(f"creatives[{i}]: primary_text 필요")
+        if c.get("cta", "LEARN_MORE") not in CTAS:
+            errs.append(f"creatives[{i}]: cta '{c.get('cta')}' 지원 안 함")
+    if errs:
+        return {"ok": False, "errors": errs}
+    if dry_run:
+        return {"ok": True, "dry_run": True, "link": link,
+                "lead_form_id": form_id or None,
+                "preview": [_creative_payload(c, c.get("image_hash", "<업로드 후 생성>"), link, form_id or None)
+                            for c in creatives]}
+    created = []
+    run = {"name": f"add_to_{adset_id}", "creatives": creatives}
+    try:
+        for c in creatives:
+            h = c.get("image_hash") or upload_image(c["image_path"])["image_hash"]
+            cr = _api("POST", f"{ACCOUNT}/adcreatives", data=_creative_payload(c, h, link, form_id or None))
+            ad = _api("POST", f"{ACCOUNT}/ads", data={
+                "name": c.get("name", "new_creative"), "adset_id": adset_id,
+                "creative": {"creative_id": cr["id"]}, "status": "PAUSED",
+            })
+            created.append({"name": c.get("name"), "ad_id": ad["id"], "creative_id": cr["id"]})
+    except MetaError as e:
+        _save_run(run, {"ads": created}, error=str(e))
+        return {"ok": False, "errors": [str(e)], "created": created}
+    _save_run(run, {"ads": created})
+    return {"ok": True, "status": "PAUSED", "created": created, "link": link}
+
+
+@mcp.tool()
+def list_ads_with_creatives(campaign_id: str) -> list:
+    """캠페인의 광고별 소재 정보(썸네일, 본문, 헤드라인, 상태)를 조회한다. 성과 좋은 카피를 참고할 때 사용."""
+    rows = _get_all(f"{campaign_id}/ads", {
+        "fields": "id,name,effective_status,adset_id,adset{name},"
+                  "creative{thumbnail_url,image_url,body,title,object_story_spec}",
+        "thumbnail_width": 300, "thumbnail_height": 300, "limit": 100,
+    }, 3)
+    out = []
+    for r in rows:
+        cr = r.get("creative") or {}
+        spec = cr.get("object_story_spec") or {}
+        ld = spec.get("link_data") or spec.get("video_data") or {}
+        out.append({
+            "ad_id": r["id"], "ad": r.get("name"), "status": r.get("effective_status"),
+            "adset_id": r.get("adset_id"), "adset": (r.get("adset") or {}).get("name"),
+            "thumbnail": cr.get("thumbnail_url") or cr.get("image_url"),
+            "body": cr.get("body") or ld.get("message", ""),
+            "title": cr.get("title") or ld.get("name") or ld.get("title", ""),
+        })
+    return out
+
+
 def _save_run(plan: dict, created: dict, error: str | None = None) -> str:
     RUNS_DIR.mkdir(exist_ok=True)
     f = RUNS_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{plan.get('name', 'run')}.json"
@@ -524,14 +643,16 @@ INSIGHT_FIELDS = ("campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,s
 
 @mcp.tool()
 def get_insights(level: str = "ad", date_preset: str = "last_7d", object_id: str = "",
-                 breakdowns: str = "") -> list:
+                 breakdowns: str = "", daily: bool = False) -> list:
     """성과 데이터 조회. level: campaign|adset|ad. date_preset: today|yesterday|last_3d|last_7d|last_14d|last_30d|this_month.
     breakdowns 예: 'age,gender' 또는 'publisher_platform'. object_id 비우면 계정 전체."""
     _need_account()
     params = {"level": level, "date_preset": date_preset, "fields": INSIGHT_FIELDS, "limit": 200}
     if breakdowns:
         params["breakdowns"] = breakdowns
-    return _get_all(f"{object_id or ACCOUNT}/insights", params)
+    if daily:
+        params["time_increment"] = 1
+    return _get_all(f"{object_id or ACCOUNT}/insights", params, max_pages=20)
 
 
 RESULT_PRIORITY = [
@@ -609,6 +730,14 @@ def set_status(object_id: str, status: str, cascade: bool = False, confirm: bool
         return {"ok": False, "error": "status 는 ACTIVE 또는 PAUSED"}
     if status == "ACTIVE" and not confirm:
         return {"ok": False, "error": "ACTIVE 전환은 과금이 시작됩니다. 사용자 승인 후 confirm=True 로 다시 호출하세요."}
+    if status == "ACTIVE" and MAX_TOTAL_DAILY_BUDGET:
+        obj = _api("GET", object_id, {"fields": "daily_budget,effective_status"})
+        add = int(obj.get("daily_budget") or 0) if obj.get("effective_status") != "ACTIVE" else 0
+        if add:
+            total = active_daily_budget_total()
+            if total + add > MAX_TOTAL_DAILY_BUDGET:
+                return {"ok": False, "error": f"켜면 전체 일예산 {total + add:,} 이 상한 {MAX_TOTAL_DAILY_BUDGET:,} 초과 "
+                                              f"— 다른 캠페인 예산을 먼저 줄이세요"}
     changed = []
     targets = [object_id]
     if cascade:
@@ -622,18 +751,34 @@ def set_status(object_id: str, status: str, cascade: bool = False, confirm: bool
 
 @mcp.tool()
 def update_daily_budget(object_id: str, daily_budget: int, confirm: bool = False) -> dict:
-    """캠페인(CBO) 또는 광고세트 일예산 변경. 상한 MAX_DAILY_BUDGET 적용, confirm=True 필요.
+    """캠페인(CBO) 또는 광고세트 일예산 변경. confirm=True 필요.
+    증액은 캠페인당 MAX_DAILY_BUDGET, 계정 전체 MAX_TOTAL_DAILY_BUDGET 을 넘을 수 없다(감액은 항상 허용).
     증액은 한 번에 20% 이내 권장(학습 재시작 방지)."""
-    if daily_budget > MAX_DAILY_BUDGET:
-        return {"ok": False, "error": f"상한 {MAX_DAILY_BUDGET:,} 초과"}
     cur = _api("GET", object_id, {"fields": "name,daily_budget"})
     old = int(cur.get("daily_budget") or 0)
+    if daily_budget <= 0:
+        return {"ok": False, "error": "예산은 양수여야 합니다. 끄려면 set_status 를 쓰세요."}
+    if daily_budget > old:
+        if daily_budget > MAX_DAILY_BUDGET:
+            return {"ok": False, "error": f"캠페인 상한 {MAX_DAILY_BUDGET:,} 초과"}
+        if MAX_TOTAL_DAILY_BUDGET:
+            total = active_daily_budget_total()
+            if total - old + daily_budget > MAX_TOTAL_DAILY_BUDGET:
+                return {"ok": False, "error": f"증액 후 전체 일예산 {total - old + daily_budget:,} 이 "
+                                              f"상한 {MAX_TOTAL_DAILY_BUDGET:,} 초과 (감액을 먼저 적용하세요)"}
     if not confirm:
         pct = f"{(daily_budget - old) / old * 100:+.0f}%" if old else "n/a"
         return {"ok": False, "preview": {"name": cur.get("name"), "from": old, "to": daily_budget, "change": pct},
                 "error": "사용자 승인 후 confirm=True 로 다시 호출하세요."}
     _api("POST", object_id, data={"daily_budget": daily_budget})
     return {"ok": True, "name": cur.get("name"), "from": old, "to": daily_budget}
+
+
+def active_daily_budget_total() -> int:
+    """집행 중인 캠페인(CBO) 일예산 합계."""
+    camps = _get_all(f"{ACCOUNT}/campaigns", {"fields": "daily_budget", "effective_status": ["ACTIVE"],
+                                             "limit": 200}, 5)
+    return sum(int(c.get("daily_budget") or 0) for c in camps)
 
 
 if __name__ == "__main__":

@@ -2,3 +2,7 @@ mcp>=1.10,<2
 httpx
 python-dotenv
 pillow
+streamlit>=1.40
+pandas
+anthropic>=2.6
+pydantic>=2
