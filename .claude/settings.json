@@ -1,0 +1,20 @@
+{
+  "enabledMcpjsonServers": ["meta-ads"],
+  "permissions": {
+    "allow": [
+      "mcp__meta-ads__account_overview",
+      "mcp__meta-ads__search_interests",
+      "mcp__meta-ads__search_locations",
+      "mcp__meta-ads__estimate_audience",
+      "mcp__meta-ads__render_ad_image",
+      "mcp__meta-ads__list_campaigns",
+      "mcp__meta-ads__list_children",
+      "mcp__meta-ads__get_insights",
+      "mcp__meta-ads__analyze_performance"
+    ],
+    "ask": [
+      "mcp__meta-ads__set_status",
+      "mcp__meta-ads__update_daily_budget"
+    ]
+  }
+}

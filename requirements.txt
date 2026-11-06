@@ -1,0 +1,4 @@
+mcp>=1.10,<2
+httpx
+python-dotenv
+pillow
